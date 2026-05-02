@@ -18,6 +18,7 @@ Tools provided:
 import sqlite3
 import os
 import re
+import sys
 import hashlib
 import json
 import time
@@ -28,6 +29,15 @@ from fastmcp import FastMCP
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from export_messages import (  # noqa: E402
+    decode_message_content,
+    msg_table_column_names,
+    try_format_quote_reply,
+)
+
 DECRYPTED_DIR = os.path.join(SCRIPT_DIR, "decrypted")
 KEYS_FILE = os.path.join(SCRIPT_DIR, "wechat_keys.json")
 SYNC_COOLDOWN = 60  # seconds between auto-syncs
@@ -226,6 +236,23 @@ def _resolve_username(chat_name):
     return None
 
 
+def _wechat_local_type_parts(local_type):
+    """64-bit packed local_type: low 32 = base MsgType, high 32 = sub-type (see export_messages)."""
+    if local_type is None:
+        return None, 0
+    try:
+        t = int(local_type)
+    except (TypeError, ValueError):
+        return local_type, 0
+    if t < 0:
+        t = t & ((1 << 64) - 1)
+    base = t & 0xFFFFFFFF
+    sub = (t >> 32) & 0xFFFFFFFF
+    if base & 0x80000000:
+        base = base - 0x100000000
+    return base, sub
+
+
 def _find_msg_table(username):
     """Find which DB contains messages for this username. Returns (db_path, table_name)."""
     table = _username_to_table(username)
@@ -261,25 +288,28 @@ def _find_all_msg_tables(username):
     return results
 
 
-def _parse_message(content, local_type, is_group, names):
+def _parse_message(content, local_type, is_group, names, wcdb_ct=None):
     """Parse message content, return formatted string."""
     if content is None:
         return ""
-    if isinstance(content, bytes):
-        try:
-            content = content.decode("utf-8", errors="replace")
-        except Exception:
-            return "(binary content)"
+    text = decode_message_content(content, wcdb_ct=wcdb_ct)
 
     sender = ""
-    text = content
-    if is_group and ":\n" in content:
-        sender, text = content.split(":\n", 1)
+    if is_group and ":\n" in text:
+        sender, text = text.split(":\n", 1)
         sender = names.get(sender, sender)
 
-    type_label = MSG_TYPE_MAP.get(local_type, f"type={local_type}")
-    if local_type != 1:
-        text = f"[{type_label}] {text[:200]}" if text else f"[{type_label}]"
+    base_type, type_sub = _wechat_local_type_parts(local_type)
+    type_label = MSG_TYPE_MAP.get(base_type, f"type={base_type}")
+    if type_sub:
+        type_label = f"{type_label} (sub:{type_sub})"
+    if base_type != 1:
+        quoted = try_format_quote_reply(text)
+        if quoted is not None:
+            text = f"[引用回复] {quoted}" if text else "[引用回复]"
+        else:
+            n = 800 if base_type == 49 else 200
+            text = f"[{type_label}] {text[:n]}" if text else f"[{type_label}]"
 
     if len(text) > 500:
         text = text[:500] + "..."
@@ -423,13 +453,23 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
         params = time_params + [limit]
         conn = sqlite3.connect(db_path)
         try:
-            db_rows = conn.execute(f"""
-                SELECT local_type, create_time, message_content
-                FROM [{table_name}]
-                {where}
-                ORDER BY create_time DESC
-                LIMIT ?
-            """, params).fetchall()
+            has_wcdb = "WCDB_CT_message_content" in msg_table_column_names(conn, table_name)
+            if has_wcdb:
+                db_rows = conn.execute(f"""
+                    SELECT local_type, create_time, message_content, WCDB_CT_message_content
+                    FROM [{table_name}]
+                    {where}
+                    ORDER BY create_time DESC
+                    LIMIT ?
+                """, params).fetchall()
+            else:
+                db_rows = conn.execute(f"""
+                    SELECT local_type, create_time, message_content
+                    FROM [{table_name}]
+                    {where}
+                    ORDER BY create_time DESC
+                    LIMIT ?
+                """, params).fetchall()
             rows.extend(db_rows)
         finally:
             conn.close()
@@ -445,9 +485,14 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
         return msg
 
     lines = []
-    for local_type, create_time, content in reversed(rows):
+    for row in reversed(rows):
+        if len(row) == 4:
+            local_type, create_time, content, wcdb_ct = row
+        else:
+            local_type, create_time, content = row
+            wcdb_ct = None
         time_str = datetime.fromtimestamp(create_time).strftime("%m-%d %H:%M")
-        text = _parse_message(content, local_type, is_group, names)
+        text = _parse_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
         lines.append(f"[{time_str}] {text}")
 
     header = f"{display_name} 的 {len(lines)} 条消息"
@@ -500,18 +545,33 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                 display = names.get(username, username) if username else tname
 
                 try:
-                    rows = conn.execute(f"""
-                        SELECT local_type, create_time, message_content
-                        FROM [{tname}]
-                        WHERE message_content LIKE ?
-                        ORDER BY create_time DESC
-                        LIMIT ?
-                    """, (f"%{keyword}%", limit - len(results))).fetchall()
+                    has_wcdb = "WCDB_CT_message_content" in msg_table_column_names(conn, tname)
+                    if has_wcdb:
+                        rows = conn.execute(f"""
+                            SELECT local_type, create_time, message_content, WCDB_CT_message_content
+                            FROM [{tname}]
+                            WHERE message_content LIKE ?
+                            ORDER BY create_time DESC
+                            LIMIT ?
+                        """, (f"%{keyword}%", limit - len(results))).fetchall()
+                    else:
+                        rows = conn.execute(f"""
+                            SELECT local_type, create_time, message_content
+                            FROM [{tname}]
+                            WHERE message_content LIKE ?
+                            ORDER BY create_time DESC
+                            LIMIT ?
+                        """, (f"%{keyword}%", limit - len(results))).fetchall()
                 except Exception:
                     continue
 
-                for local_type, ts, content in rows:
-                    text = _parse_message(content, local_type, is_group, names)
+                for row in rows:
+                    if has_wcdb:
+                        local_type, ts, content, wcdb_ct = row
+                    else:
+                        local_type, ts, content = row
+                        wcdb_ct = None
+                    text = _parse_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
                     time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
                     entry = f"[{time_str}] [{display}] {text}"
                     if len(entry) > 300:
