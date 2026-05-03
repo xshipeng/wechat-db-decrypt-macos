@@ -8,14 +8,16 @@ Requirements:
 Usage:
     python3 decrypt_db.py                  # decrypt all databases
     python3 decrypt_db.py -o ./decrypted   # specify output directory
+    python3 decrypt_db.py -j 48          # explicit workers (default oversubscribes CPUs)
 """
 
+import argparse
+import glob
 import json
 import os
 import subprocess
 import sys
-import glob
-import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DB_DIR = os.path.expanduser(
     "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
@@ -84,6 +86,12 @@ DETACH DATABASE plaintext;
         return False, str(e)
 
 
+def _decrypt_job(sqlcipher_bin, db_rel_path, src_path, dst_path, key_hex):
+    """Run in worker thread; returns (db_rel_path, dst_path, success, detail)."""
+    ok, detail = decrypt_database(sqlcipher_bin, src_path, dst_path, key_hex)
+    return db_rel_path, dst_path, ok, detail
+
+
 def main():
     parser = argparse.ArgumentParser(description="Decrypt WeChat databases")
     parser.add_argument(
@@ -97,7 +105,23 @@ def main():
         default="decrypted",
         help="Output directory for decrypted databases (default: decrypted)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel decrypt workers (each runs sqlcipher). "
+            "Default oversubscribes CPU (≈8× cores, capped) so disk/subprocess latency can overlap; "
+            "use -j 1 for sequential."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.jobs is not None and args.jobs < 1:
+        print("[-] --jobs must be >= 1", file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.isfile(args.keys):
         print(f"[-] Key file not found: {args.keys}")
@@ -119,20 +143,58 @@ def main():
     print(f"[*] DB storage: {db_dir}")
 
     entries = {k: v for k, v in data.items() if not k.startswith("__")}
-    print(f"[*] Decrypting {len(entries)} databases to {args.output}/\n")
 
-    passed = 0
-    failed = 0
-
+    tasks = []
+    skipped = []
     for db_rel_path, key_hex in sorted(entries.items()):
         src = os.path.join(db_dir, db_rel_path)
         dst = os.path.join(args.output, db_rel_path)
-
         if not os.path.isfile(src):
-            print(f"  ⏭️  {db_rel_path}: source file not found, skipping")
+            skipped.append(db_rel_path)
             continue
+        tasks.append((db_rel_path, src, dst, key_hex))
 
-        success, detail = decrypt_database(sqlcipher_bin, src, dst, key_hex)
+    cpus = os.cpu_count() or 4
+    if args.jobs is not None:
+        jobs = args.jobs
+    else:
+        # Oversubscribe: each worker is mostly waiting on sqlcipher / IO; keep many in flight.
+        overshoot = max(24, cpus * 8)
+        jobs = max(1, min(len(tasks), overshoot, 256))
+
+    print(
+        f"[*] Decrypting {len(entries)} databases to {args.output}/ "
+        f"(workers={jobs}, CPUs={cpus}, pending={len(tasks)})\n"
+    )
+
+    for db_rel_path in skipped:
+        print(f"  ⏭️  {db_rel_path}: source file not found, skipping")
+
+    passed = 0
+    failed = 0
+    results = []
+
+    if jobs <= 1:
+        for db_rel_path, src, dst, key_hex in tasks:
+            db_rel_path, dst, success, detail = _decrypt_job(
+                sqlcipher_bin, db_rel_path, src, dst, key_hex
+            )
+            results.append((db_rel_path, dst, success, detail))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            future_to_rel = {
+                pool.submit(
+                    _decrypt_job, sqlcipher_bin, rel, s, d, k
+                ): rel
+                for rel, s, d, k in tasks
+            }
+            for fut in as_completed(future_to_rel):
+                results.append(fut.result())
+
+    order = {rel: i for i, (rel, _, _, _) in enumerate(tasks)}
+    results.sort(key=lambda x: order.get(x[0], 0))
+
+    for db_rel_path, dst, success, detail in results:
         if success:
             dst_size = os.path.getsize(dst)
             print(f"  ✅ {db_rel_path} -> {dst} ({dst_size / 1024:.0f} KB)")

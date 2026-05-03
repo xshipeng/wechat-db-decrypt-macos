@@ -20,8 +20,6 @@ import os
 import re
 import sys
 import hashlib
-import json
-import time
 from datetime import datetime
 
 from fastmcp import FastMCP
@@ -32,108 +30,26 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from export_messages import (  # noqa: E402
-    decode_message_content,
-    msg_table_column_names,
-    try_format_quote_reply,
-)
+from export_messages import msg_table_column_names  # noqa: E402
+from mcp_auto_sync import auto_sync_incremental  # noqa: E402
+from mcp_message_format import MSG_TYPE_MAP, format_mcp_message  # noqa: E402
 
 DECRYPTED_DIR = os.path.join(SCRIPT_DIR, "decrypted")
 KEYS_FILE = os.path.join(SCRIPT_DIR, "wechat_keys.json")
 SYNC_COOLDOWN = 60  # seconds between auto-syncs
 
-_last_sync_time = 0
-
-MSG_TYPE_MAP = {
-    1: "文本", 3: "图片", 34: "语音", 42: "名片",
-    43: "视频", 47: "表情", 48: "位置", 49: "链接/文件",
-    50: "通话", 10000: "系统", 10002: "撤回",
-}
-
-
-# ── Auto-sync ────────────────────────────────────────────────────────────────
-
-
-def _find_db_dir():
-    """Find WeChat's encrypted db_storage directory."""
-    import glob as _glob
-    base = os.path.expanduser(
-        "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
-    )
-    candidates = _glob.glob(os.path.join(base, "*", "db_storage"))
-    return candidates[0] if candidates else None
-
-
-def _find_sqlcipher():
-    brew_path = "/opt/homebrew/opt/sqlcipher/bin/sqlcipher"
-    if os.path.isfile(brew_path):
-        return brew_path
-    for p in os.environ.get("PATH", "").split(":"):
-        c = os.path.join(p, "sqlcipher")
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def _decrypt_one(sqlcipher_bin, src, dst, key_hex):
-    """Decrypt a single SQLCipher database."""
-    import subprocess
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst):
-        os.remove(dst)
-    sql = f"""PRAGMA key = "x'{key_hex}'";
-PRAGMA cipher_page_size = 4096;
-ATTACH DATABASE '{dst}' AS plaintext KEY '';
-SELECT sqlcipher_export('plaintext');
-DETACH DATABASE plaintext;
-"""
-    try:
-        r = subprocess.run(
-            [sqlcipher_bin, src], input=sql,
-            capture_output=True, text=True, timeout=120,
-        )
-        return r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0
-    except Exception:
-        return False
-
 
 def _auto_sync(force=False):
     """Re-decrypt only databases whose source file has changed. Clears contact cache if any DB was updated."""
-    global _last_sync_time, _contacts, _contacts_full
-
-    now = time.time()
-    if not force and (now - _last_sync_time) < SYNC_COOLDOWN:
-        return
-
-    if not os.path.isfile(KEYS_FILE):
-        return
-
-    sqlcipher_bin = _find_sqlcipher()
-    db_dir = _find_db_dir()
-    if not sqlcipher_bin or not db_dir:
-        return
-
-    with open(KEYS_FILE) as f:
-        keys = json.load(f)
-
-    updated = False
-    for db_rel, key_hex in keys.items():
-        if db_rel.startswith("__"):
-            continue
-        src = os.path.join(db_dir, db_rel)
-        dst = os.path.join(DECRYPTED_DIR, db_rel)
-        if not os.path.isfile(src):
-            continue
-        # Skip if decrypted file is newer than source
-        if not force and os.path.isfile(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
-            continue
-        if _decrypt_one(sqlcipher_bin, src, dst, key_hex):
-            updated = True
-
-    if updated:
+    global _contacts, _contacts_full
+    if auto_sync_incremental(
+        DECRYPTED_DIR,
+        KEYS_FILE,
+        force=force,
+        cooldown_sec=SYNC_COOLDOWN,
+    ):
         _contacts = None
         _contacts_full = None
-    _last_sync_time = time.time()
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -236,23 +152,6 @@ def _resolve_username(chat_name):
     return None
 
 
-def _wechat_local_type_parts(local_type):
-    """64-bit packed local_type: low 32 = base MsgType, high 32 = sub-type (see export_messages)."""
-    if local_type is None:
-        return None, 0
-    try:
-        t = int(local_type)
-    except (TypeError, ValueError):
-        return local_type, 0
-    if t < 0:
-        t = t & ((1 << 64) - 1)
-    base = t & 0xFFFFFFFF
-    sub = (t >> 32) & 0xFFFFFFFF
-    if base & 0x80000000:
-        base = base - 0x100000000
-    return base, sub
-
-
 def _find_msg_table(username):
     """Find which DB contains messages for this username. Returns (db_path, table_name)."""
     table = _username_to_table(username)
@@ -286,37 +185,6 @@ def _find_all_msg_tables(username):
         finally:
             conn.close()
     return results
-
-
-def _parse_message(content, local_type, is_group, names, wcdb_ct=None):
-    """Parse message content, return formatted string."""
-    if content is None:
-        return ""
-    text = decode_message_content(content, wcdb_ct=wcdb_ct)
-
-    sender = ""
-    if is_group and ":\n" in text:
-        sender, text = text.split(":\n", 1)
-        sender = names.get(sender, sender)
-
-    base_type, type_sub = _wechat_local_type_parts(local_type)
-    type_label = MSG_TYPE_MAP.get(base_type, f"type={base_type}")
-    if type_sub:
-        type_label = f"{type_label} (sub:{type_sub})"
-    if base_type != 1:
-        quoted = try_format_quote_reply(text)
-        if quoted is not None:
-            text = f"[引用回复] {quoted}" if text else "[引用回复]"
-        else:
-            n = 800 if base_type == 49 else 200
-            text = f"[{type_label}] {text[:n]}" if text else f"[{type_label}]"
-
-    if len(text) > 500:
-        text = text[:500] + "..."
-
-    if sender:
-        return f"{sender}: {text}"
-    return text
 
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
@@ -492,7 +360,7 @@ def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_
             local_type, create_time, content = row
             wcdb_ct = None
         time_str = datetime.fromtimestamp(create_time).strftime("%m-%d %H:%M")
-        text = _parse_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
+        text = format_mcp_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
         lines.append(f"[{time_str}] {text}")
 
     header = f"{display_name} 的 {len(lines)} 条消息"
@@ -571,7 +439,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                     else:
                         local_type, ts, content = row
                         wcdb_ct = None
-                    text = _parse_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
+                    text = format_mcp_message(content, local_type, is_group, names, wcdb_ct=wcdb_ct)
                     time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
                     entry = f"[{time_str}] [{display}] {text}"
                     if len(entry) > 300:

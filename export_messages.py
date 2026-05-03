@@ -10,6 +10,14 @@ Usage:
     python3 export_messages.py --all               # export all chats
     python3 export_messages.py -c wxid_xxx -n 50   # last 50 messages
     python3 export_messages.py -s "keyword"        # search keyword
+    python3 export_messages.py -c wxid_xxx --markdown --inline-images  # Markdown + local ![](...) paths
+
+Requires ``pip install zstandard`` when ``WCDB_CT_message_content == 4`` (compressed blobs).
+
+Inline images/stickers consult decrypted ``hardlink/hardlink.db``, optional ``message/message_resource.db``,
+and filesystem caches under each ``…/xwechat_files/<account>/`` (see ``export_media_resolve.py``).
+``.dat`` thumbnails may decode as XOR, V1 AES (built-in key), or V2 AES (needs ``--dat-aes-key`` / env).
+Decoded raster previews are copied beside the export under ``_wechat_media/`` unless ``--raw-dat-links``.
 """
 
 import sqlite3
@@ -21,7 +29,6 @@ import hashlib
 import argparse
 import glob
 from datetime import datetime
-
 try:
     import zstandard
 except ImportError:
@@ -99,10 +106,10 @@ def decode_message_content(content, wcdb_ct=None):
 
 
 def try_format_quote_reply(s: str):
-    """If content is 引用/回复 (appmsg type 57) with <refermsg>, return one-line text or None.
+    """If content is quote/reply appmsg (type 57) with ``<refermsg>``, return one-line text or None.
 
-    - New reply: first <appmsg><title>…
-    - Referenced: <refermsg><displayname>, <content>, <svrid> (for correlation in DB)
+    - New reply: first ``<appmsg><title>`` …
+    - Referenced: ``<refermsg>`` display name, content, svrid (for DB correlation)
     """
     s = (s or "").strip()
     if not s or "refermsg" not in s.lower():
@@ -153,25 +160,31 @@ def try_format_quote_reply(s: str):
     return " ".join(bits)
 
 
-def summarize_image_message_xml(s: str) -> str:
-    """WeChat type-3 content is <msg><img …/> XML pointing at CDN/encrypted data, not inline pixels."""
-    if not s or "<img" not in s.lower():
-        return ""
-    m_md5 = re.search(r'\bmd5="([^"]+)"', s, re.IGNORECASE)
-    if not m_md5:
-        m_md5 = re.search(r"<md5>([^<]+)</md5>", s, re.IGNORECASE)
-    m_len = re.search(
-        r'\b(?:length|totallen|cdnthumblength)="(\d+)"', s, re.IGNORECASE
-    )
-    parts = []
-    if m_md5:
-        parts.append(f"file_md5={m_md5.group(1)[:32]}")
-    if m_len:
-        parts.append(f"len={m_len.group(1)}")
-    return " ".join(parts)
+from export_media_preview import (
+    load_wechat_dat_aes_key_v2,
+    markdown_image_link,
+    markdown_inline_image_link,
+)
+from export_media_resolve import (
+    clear_media_resolve_cache,
+    discover_wechat_account_roots,
+    extract_image_md5_from_xml,
+    extract_sticker_md5_candidates_from_xml,
+    find_local_chat_image_by_exact_length,
+    find_local_chat_image_path,
+    lookup_storage_md5_via_message_resource,
+    message_resource_db_path,
+    parse_emoji_xml_byte_length,
+    parse_image_xml_byte_length,
+    resolve_any_hardlink_db,
+    resolve_wechat_cached_media,
+    summarize_emoji_message_xml,
+    summarize_image_message_xml,
+)
 
 
 DECRYPTED_DIR = "decrypted"
+
 MSG_TYPE_MAP = {
     1: "text",
     3: "image",
@@ -204,7 +217,7 @@ def load_contacts(decrypted_dir):
         for username, remark, nick_name in conn.execute(
             "SELECT username, remark, nick_name FROM contact"
         ):
-            # Priority: remark (备注名) > nick_name (昵称) > username
+            # Priority: remark > nick_name > username
             name = remark or nick_name or username
             if name:
                 contacts[username] = name
@@ -423,7 +436,7 @@ def _normalize_sender_id(sender_id):
         return None
 
 
-def _wechat_local_type_parts(local_type):
+def wechat_local_type_parts(local_type):
     """WeChat can store a 64-bit packed value: message kind in the low 32 bits,
     sub-type (e.g. app message class) in the high 32 bits. MSG_TYPE_MAP keys use the base only."""
     if local_type is None:
@@ -441,6 +454,20 @@ def _wechat_local_type_parts(local_type):
     return base, sub
 
 
+def _resolve_cached_attach(md5_hex, roots, peer_username, hardlink_db_path):
+    """Filesystem attach scan then ``hardlink`` image/file indexes."""
+    apath = resolve_wechat_cached_media(roots, md5_hex, peer_username)
+    if apath:
+        return apath
+    if hardlink_db_path:
+        apath = resolve_any_hardlink_db(md5_hex, hardlink_db_path, roots)
+        if apath:
+            return apath
+    if peer_username:
+        return resolve_wechat_cached_media(roots, md5_hex, None)
+    return None
+
+
 def format_message(
     row,
     is_group,
@@ -449,21 +476,26 @@ def format_message(
     my_sender_id=None,
     name2id_by_rowid=None,
     peer_sender_rowid=None,
+    *,
+    markdown=False,
+    inline_images=False,
+    output_dir=None,
+    media_roots=None,
+    hardlink_db_path=None,
+    decode_dat_images=True,
+    dat_aes_key_v2=None,
+    decrypted_db_root=None,
 ):
     """Format a single message row for display.
 
-    Private chats: real_sender_id equals Name2Id.rowid for the peer -> 对方；否则 -> 我。
+    Private chats: real_sender_id equals Name2Id.rowid for the peer (them), else self.
     Fallback: detect_my_sender_id() or name2id wxid match.
     Group chats: prefer wxid:\\n prefix in content; else resolve real_sender_id via Name2Id.
     """
-    if len(row) == 7:
-        local_id, local_type, create_time, sender_id, content, wcdb_ct, source = row
-    else:
-        local_id, local_type, create_time, sender_id, content, source = row
-        wcdb_ct = None
+    local_id, server_id, local_type, create_time, sender_id, content, wcdb_ct, source = row
 
     ts = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S") if create_time else "?"
-    base_type, type_sub = _wechat_local_type_parts(local_type)
+    base_type, type_sub = wechat_local_type_parts(local_type)
     type_name = MSG_TYPE_MAP.get(base_type, f"type:{base_type}")
     if type_sub:
         type_name = f"{type_name} (sub:{type_sub})"
@@ -507,15 +539,148 @@ def format_message(
         if quoted is not None:
             body = f"[引用回复] {quoted}" if body else "[引用回复]"
         elif base_type == 3:
-            sm = summarize_image_message_xml(body)
-            if sm:
-                body = f"[image] {sm}"
+            roots = media_roots if media_roots else []
+            out_base = output_dir if output_dir else os.getcwd()
+            if inline_images and roots:
+                img_md5 = extract_image_md5_from_xml(body)
+                storage_md5 = None
+                if decrypted_db_root and peer_username:
+                    storage_md5 = lookup_storage_md5_via_message_resource(
+                        decrypted_db_root,
+                        peer_username,
+                        local_id,
+                        create_time,
+                        server_id,
+                    )
+                chain = []
+                if storage_md5:
+                    chain.append(storage_md5)
+                if img_md5 and img_md5 not in chain:
+                    chain.append(img_md5)
+                apath = None
+                for cand in chain:
+                    apath = _resolve_cached_attach(
+                        cand, roots, peer_username, hardlink_db_path
+                    )
+                    if apath:
+                        break
+                if not apath and peer_username:
+                    bl = parse_image_xml_byte_length(body)
+                    if bl is not None:
+                        apath = find_local_chat_image_by_exact_length(
+                            peer_username, bl, roots, create_time
+                        )
+                if apath:
+                    if markdown:
+                        body = markdown_inline_image_link(
+                            apath,
+                            out_base,
+                            decode_xor_dat=decode_dat_images,
+                            aes_key_v2_16=dat_aes_key_v2,
+                        )
+                    else:
+                        body = markdown_image_link(apath, out_base)
+                else:
+                    sm = summarize_image_message_xml(body)
+                    miss = sm or (f"md5={img_md5}" if img_md5 else "no attrs")
+                    body = (
+                        f"*(local image not found: {miss}; tried message_resource + attach + hardlink)*"
+                        if markdown
+                        else f"[image] {miss} (cache miss)"
+                    )
             else:
-                body = f"[image] (no md5/len in XML) {body[:200]}"
+                sm = summarize_image_message_xml(body)
+                if sm:
+                    body = f"*[image]* {sm}" if markdown else f"[image] {sm}"
+                else:
+                    body = (
+                        f"*[image]* (no md5/len in XML) `{body[:200]}`"
+                        if markdown
+                        else f"[image] (no md5/len in XML) {body[:200]}"
+                    )
+        elif base_type == 47:
+            roots = media_roots if media_roots else []
+            out_base = output_dir if output_dir else os.getcwd()
+            summary = summarize_emoji_message_xml(body)
+            sticker_md5s = extract_sticker_md5_candidates_from_xml(body)
+            storage_md5 = None
+            if decrypted_db_root and peer_username:
+                storage_md5 = lookup_storage_md5_via_message_resource(
+                    decrypted_db_root,
+                    peer_username,
+                    local_id,
+                    create_time,
+                    server_id,
+                )
+            apath = None
+            tried_resolve = False
+            if inline_images and roots:
+                tried_resolve = (
+                    bool(sticker_md5s)
+                    or parse_emoji_xml_byte_length(body) is not None
+                    or storage_md5 is not None
+                )
+                chain = []
+                if storage_md5:
+                    chain.append(storage_md5)
+                for sm in sticker_md5s:
+                    if sm not in chain:
+                        chain.append(sm)
+                for cand in chain:
+                    apath = _resolve_cached_attach(
+                        cand, roots, peer_username, hardlink_db_path
+                    )
+                    if apath:
+                        break
+                if not apath and peer_username:
+                    bl = parse_emoji_xml_byte_length(body)
+                    if bl is not None:
+                        apath = find_local_chat_image_by_exact_length(
+                            peer_username,
+                            bl,
+                            roots,
+                            create_time,
+                            attach_subdirs=(
+                                "Emoji",
+                                "emoji",
+                                "emotion",
+                                "Img",
+                            ),
+                        )
+                if apath:
+                    if markdown:
+                        body = markdown_inline_image_link(
+                            apath,
+                            out_base,
+                            decode_xor_dat=decode_dat_images,
+                            aes_key_v2_16=dat_aes_key_v2,
+                        )
+                    else:
+                        body = markdown_image_link(apath, out_base)
+                elif tried_resolve and markdown:
+                    hint = summary or "parse failed"
+                    body = f"*[emoji]* {hint} *(sticker file not found)*"
+                elif tried_resolve:
+                    body = (
+                        f"[emoji] {summary} (cache miss)"
+                        if summary
+                        else "[emoji] (cache miss)"
+                    )
+            elif markdown:
+                body = f"*[emoji]* {summary}" if summary else "*[emoji]*"
+            else:
+                body = f"[emoji] {summary}" if summary else "[emoji]"
         else:
             n = 800 if base_type == 49 else 100
-            body = f"[{type_name}] {body[:n]}" if body else f"[{type_name}]"
+            if markdown:
+                body = f"*{type_name}* {body[:n]}" if body else f"*{type_name}*"
+            else:
+                body = f"[{type_name}] {body[:n]}" if body else f"[{type_name}]"
 
+    if markdown:
+        if sender:
+            return f"**[{ts}]** **{sender}:** {body}"
+        return f"**[{ts}]** {body}"
     if sender:
         return f"[{ts}] {sender}: {body}"
     return f"[{ts}] {body}"
@@ -582,8 +747,23 @@ def list_conversations(msg_dbs, session_db_path, contacts):
     return results
 
 
-def export_chat(msg_dbs, username, contacts, limit=None):
+def export_chat(
+    msg_dbs,
+    username,
+    contacts,
+    limit=None,
+    *,
+    markdown=False,
+    inline_images=False,
+    media_roots=None,
+    output_dir=None,
+    hardlink_db_path=None,
+    decode_dat_images=True,
+    dat_aes_key_v2=None,
+    decrypted_db_root=None,
+):
     """Export messages for a specific conversation from all message DBs."""
+    clear_media_resolve_cache()
     table = username_to_table(username)
     is_group = "@chatroom" in username
 
@@ -609,28 +789,28 @@ def export_chat(msg_dbs, username, contacts, limit=None):
             has_wcdb = "WCDB_CT_message_content" in cols
             if has_wcdb:
                 q = (
-                    f"SELECT local_id, local_type, create_time, real_sender_id, "
+                    f"SELECT local_id, server_id, local_type, create_time, real_sender_id, "
                     f"message_content, WCDB_CT_message_content, source FROM [{table}] "
                     f"ORDER BY create_time ASC"
                 )
             else:
                 q = (
-                    f"SELECT local_id, local_type, create_time, real_sender_id, "
+                    f"SELECT local_id, server_id, local_type, create_time, real_sender_id, "
                     f"message_content, source FROM [{table}] ORDER BY create_time ASC"
                 )
             for r in conn.execute(q).fetchall():
                 if not has_wcdb:
-                    r = (*r[:5], None, r[5])
+                    r = (r[0], r[1], r[2], r[3], r[4], r[5], None, r[6])
                 tagged_rows.append((db_path, r))
         finally:
             conn.close()
 
-    tagged_rows.sort(key=lambda x: (x[1][2], x[1][0]))
+    tagged_rows.sort(key=lambda x: (x[1][3], x[1][0]))
 
     if limit:
-        tagged_rows.sort(key=lambda x: x[1][2], reverse=True)
+        tagged_rows.sort(key=lambda x: x[1][3], reverse=True)
         tagged_rows = tagged_rows[:limit]
-        tagged_rows.sort(key=lambda x: (x[1][2], x[1][0]))
+        tagged_rows.sort(key=lambda x: (x[1][3], x[1][0]))
 
     lines = []
     for db_path, r in tagged_rows:
@@ -644,6 +824,14 @@ def export_chat(msg_dbs, username, contacts, limit=None):
                 my_sender_id=my_sender_id,
                 name2id_by_rowid=name2id_by_rowid,
                 peer_sender_rowid=peer_sender_rowid,
+                markdown=markdown,
+                inline_images=inline_images,
+                output_dir=output_dir,
+                media_roots=media_roots,
+                hardlink_db_path=hardlink_db_path,
+                decode_dat_images=decode_dat_images,
+                dat_aes_key_v2=dat_aes_key_v2,
+                decrypted_db_root=decrypted_db_root,
             )
         )
 
@@ -666,9 +854,36 @@ def safe_filename(display_name, username):
     return name
 
 
-def export_to_file(msg_dbs, username, output_dir, contacts, limit=None):
+def export_to_file(
+    msg_dbs,
+    username,
+    output_dir,
+    contacts,
+    limit=None,
+    *,
+    markdown=False,
+    inline_images=False,
+    media_roots=None,
+    hardlink_db_path=None,
+    decode_dat_images=True,
+    dat_aes_key_v2=None,
+    decrypted_db_root=None,
+):
     """Export messages to a text file named by display name."""
-    lines, info = export_chat(msg_dbs, username, contacts, limit)
+    lines, info = export_chat(
+        msg_dbs,
+        username,
+        contacts,
+        limit,
+        markdown=markdown,
+        inline_images=inline_images,
+        media_roots=media_roots,
+        output_dir=os.path.abspath(output_dir),
+        hardlink_db_path=hardlink_db_path,
+        decode_dat_images=decode_dat_images,
+        dat_aes_key_v2=dat_aes_key_v2,
+        decrypted_db_root=decrypted_db_root,
+    )
     if lines is None:
         return False, info
 
@@ -676,17 +891,23 @@ def export_to_file(msg_dbs, username, output_dir, contacts, limit=None):
 
     display_name = contacts.get(username, "")
     fname = safe_filename(display_name, username)
-    output_path = os.path.join(output_dir, f"{fname}.txt")
+    ext = ".md" if markdown else ".txt"
+    output_path = os.path.join(output_dir, f"{fname}{ext}")
 
     # Avoid collision
     if os.path.exists(output_path):
-        output_path = os.path.join(output_dir, f"{fname}_{username.replace('@', '_at_')}.txt")
+        output_path = os.path.join(
+            output_dir, f"{fname}_{username.replace('@', '_at_')}{ext}"
+        )
+
+    sep = "\n\n" if markdown else "\n"
+    body_text = sep.join(lines)
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"# Chat: {display_name or username} ({username})\n")
-        f.write(f"# {info}\n")
-        f.write(f"# Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write("\n".join(lines))
+        f.write(f"# Chat: {display_name or username} ({username})\n\n")
+        f.write(f"- {info}\n")
+        f.write(f"- Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(body_text)
         f.write("\n")
 
     return True, f"{os.path.basename(output_path)} | {info}"
@@ -709,7 +930,55 @@ def main():
     parser.add_argument(
         "-s", "--search", help="Search keyword across all conversations",
     )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="Write Markdown (.md): bold timestamps, image stubs as italic; combine with --inline-images for ![](...) paths",
+    )
+    parser.add_argument(
+        "--inline-images",
+        action="store_true",
+        help="Resolve cached Msg attach Img/*.dat paths under WeChat xwechat_files and emit Markdown image links (enables Markdown formatting)",
+    )
+    parser.add_argument(
+        "--media-root",
+        action="append",
+        metavar="DIR",
+        dest="media_roots",
+        help=(
+            "Account directory under xwechat_files (must contain msg/). "
+            "Repeatable; default: all …/xwechat_files/*/ that have msg/"
+        ),
+    )
+    parser.add_argument(
+        "--raw-dat-links",
+        action="store_true",
+        help=(
+            "With --inline-images: point ![](…) at WeChat .dat files only (no XOR copy). "
+            "Default decodes common XOR thumbnails into ./_wechat_media/*.jpg|.png so Markdown preview works."
+        ),
+    )
+    parser.add_argument(
+        "--dat-aes-key",
+        metavar="HEX32",
+        default=None,
+        help=(
+            "32 hex chars (16-byte AES key) for WeChat V2 `.dat` cache files "
+            "(see WECHAT_DAT_AES_KEY env). V1 `.dat` uses a fixed key and does not need this."
+        ),
+    )
     args = parser.parse_args()
+
+    markdown_mode = args.markdown or args.inline_images
+    decode_dat_images = not args.raw_dat_links
+    dat_aes_key_v2 = load_wechat_dat_aes_key_v2(args.dat_aes_key)
+    media_roots = discover_wechat_account_roots(args.media_roots)
+    if args.inline_images and not media_roots:
+        print(
+            "[!] --inline-images: no account folders found; specify --media-root pointing at "
+            "…/xwechat_files/<your_account_dir>",
+            file=sys.stderr,
+        )
 
     # Load databases
     msg_dbs = get_all_msg_dbs(args.dir)
@@ -723,6 +992,20 @@ def main():
     session_db = get_session_db_path(args.dir)
     contacts = load_contacts(args.dir)
     print(f"[*] Loaded {len(contacts)} contacts")
+
+    decrypted_abs = os.path.abspath(args.dir)
+
+    hardlink_db_path = os.path.join(decrypted_abs, "hardlink", "hardlink.db")
+    hardlink_db_path = hardlink_db_path if os.path.isfile(hardlink_db_path) else None
+    if args.inline_images and hardlink_db_path:
+        print(f"[*] Using hardlink DB for image path fallback: {hardlink_db_path}")
+    if args.inline_images and dat_aes_key_v2 and decode_dat_images:
+        print("[*] WeChat V2 `.dat` AES key loaded (HEX32); full-resolution caches may decode")
+    if args.inline_images and message_resource_db_path(decrypted_abs):
+        print(
+            "[*] Using message/resource DB joins (storage md5 from packed_info): "
+            f"{os.path.join(decrypted_abs, 'message', 'message_resource.db')}"
+        )
 
     if args.search:
         # Search across all conversations
@@ -741,26 +1024,26 @@ def main():
                     )
                     if has_wcdb:
                         sql = (
-                            f"SELECT local_id, local_type, create_time, real_sender_id, "
+                            f"SELECT local_id, server_id, local_type, create_time, real_sender_id, "
                             f"message_content, WCDB_CT_message_content, source FROM [{table}] "
                             f"WHERE message_content LIKE ? ORDER BY create_time DESC LIMIT 10"
                         )
                     else:
                         sql = (
-                            f"SELECT local_id, local_type, create_time, real_sender_id, "
+                            f"SELECT local_id, server_id, local_type, create_time, real_sender_id, "
                             f"message_content, source FROM [{table}] "
                             f"WHERE message_content LIKE ? ORDER BY create_time DESC LIMIT 10"
                         )
                     rows = conn.execute(sql, (f"%{args.search}%",)).fetchall()
                     for r in rows:
                         if not has_wcdb:
-                            r = (*r[:5], None, r[5])
+                            r = (r[0], r[1], r[2], r[3], r[4], r[5], None, r[6])
                         tagged.append((db_path, r))
                 finally:
                     conn.close()
             if not tagged:
                 continue
-            tagged.sort(key=lambda x: x[1][2], reverse=True)
+            tagged.sort(key=lambda x: x[1][3], reverse=True)
             tagged = tagged[:10]
 
             display = contacts.get(username, username)
@@ -781,7 +1064,7 @@ def main():
             for db_path, r in tagged:
                 my_sid, n2i = sender_format_context(db_path)
                 print(
-                    f"  {format_message(r, is_group, contacts, peer_username=username, my_sender_id=my_sid, name2id_by_rowid=n2i, peer_sender_rowid=peer_rid_for(db_path))}"
+                    f"  {format_message(r, is_group, contacts, peer_username=username, my_sender_id=my_sid, name2id_by_rowid=n2i, peer_sender_rowid=peer_rid_for(db_path), decrypted_db_root=decrypted_abs)}"
                 )
             print()
             found += len(tagged)
@@ -799,16 +1082,45 @@ def main():
             display = contacts.get(username, username)
             print(f"[*] Matched '{args.chat}' -> {display} ({username})")
 
-        lines, info = export_chat(msg_dbs, username, contacts, args.limit)
+        lines, info = export_chat(
+            msg_dbs,
+            username,
+            contacts,
+            args.limit,
+            markdown=markdown_mode,
+            inline_images=args.inline_images,
+            media_roots=media_roots,
+            output_dir=os.path.abspath(args.output),
+            hardlink_db_path=hardlink_db_path,
+            decode_dat_images=decode_dat_images,
+            dat_aes_key_v2=dat_aes_key_v2,
+            decrypted_db_root=decrypted_abs,
+        )
         if lines is None:
             print(f"[-] {info}")
             sys.exit(1)
 
         print(f"[*] {info}\n")
-        for line in lines:
-            print(line)
+        if markdown_mode:
+            print("\n\n".join(lines))
+        else:
+            for line in lines:
+                print(line)
 
-        success, result_info = export_to_file(msg_dbs, username, args.output, contacts, args.limit)
+        success, result_info = export_to_file(
+            msg_dbs,
+            username,
+            args.output,
+            contacts,
+            args.limit,
+            markdown=markdown_mode,
+            inline_images=args.inline_images,
+            media_roots=media_roots,
+            hardlink_db_path=hardlink_db_path,
+            decode_dat_images=decode_dat_images,
+            dat_aes_key_v2=dat_aes_key_v2,
+            decrypted_db_root=decrypted_abs,
+        )
         print(f"\n[*] Saved: {result_info}")
 
     elif args.all:
@@ -820,7 +1132,18 @@ def main():
             if not c["has_msgs"]:
                 continue
             success, info = export_to_file(
-                msg_dbs, c["username"], args.output, contacts, args.limit,
+                msg_dbs,
+                c["username"],
+                args.output,
+                contacts,
+                args.limit,
+                markdown=markdown_mode,
+                inline_images=args.inline_images,
+                media_roots=media_roots,
+                hardlink_db_path=hardlink_db_path,
+                decode_dat_images=decode_dat_images,
+                dat_aes_key_v2=dat_aes_key_v2,
+                decrypted_db_root=decrypted_abs,
             )
             if success:
                 print(f"  ✅ {info}")

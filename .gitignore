@@ -7,6 +7,9 @@ __pycache__
 wechat_keys.json
 wechat_keys*.json
 
-# Output directories
+# Output directories (never commit decrypted DBs or chat exports)
 decrypted/
 exported/
+exported_agent_verify/
+exported_agent_verify_full/
+exported_auto*/
